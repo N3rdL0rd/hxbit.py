@@ -1,0 +1,14 @@
+[project]
+name = "hxbit"
+version = "0.1.0"
+description = "Reimplementation of Haxe's hxbit in Python for manipulating serialised Haxe classes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true

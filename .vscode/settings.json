@@ -1,11 +1,18 @@
 {
     "cSpell.words": [
         "cdef",
+        "classdefs",
         "clid",
         "crashlink",
+        "defn",
+        "deserialisation",
         "deserialise",
         "Deserialises",
+        "Deserialising",
+        "haxe",
         "hxbit",
+        "nfield",
+        "nfields",
         "varint"
     ]
 }

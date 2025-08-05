@@ -2,7 +2,7 @@ import pytest
 from hxbit import HXSFile
 from glob import glob
 
-test_files = glob("tests/hxs/*.bin")
+test_files = glob("tests/hxs/*/*.bin", recursive=True)
 
 
 @pytest.mark.parametrize("path", test_files)

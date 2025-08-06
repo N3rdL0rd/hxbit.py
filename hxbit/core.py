@@ -1,12 +1,13 @@
 
 from abc import ABC, abstractmethod
 from io import BytesIO
-from typing import Any, Dict, Set, Tuple, Union, BinaryIO, Literal, TypeVar, List
+from typing import Any, Dict, Optional, Set, Tuple, Union, BinaryIO, Literal, TypeVar, List
 import struct
 import inspect
 from enum import Enum
 
-from .types import deadcells # TODO: load dynamically
+from . import shims
+from .debug import DEBUG
 
 T = TypeVar("T", bound="VarInt")
 
@@ -25,9 +26,6 @@ def hxbit_hash(name: str) -> int:
     v &= 0x3FFFFFFF
     v = 1 + (v % 65423)
     return v
-
-
-DEBUG = True
 
 
 def tell(message: str | None = None) -> None:
@@ -1041,7 +1039,7 @@ class HXSFile(Serialisable):
     schemas: List[Schema]
     objects: Dict[int, Obj]  # uid, obj
 
-    def __init__(self) -> None:
+    def __init__(self, shims: Optional[str]=None) -> None:
         self.magic = String("HXS")
         self.version = SerialisableInt()
         self.version.value = 1
@@ -1051,6 +1049,7 @@ class HXSFile(Serialisable):
         self.schemas = []
         self.objects = {} # Read cache
         self.obj: Obj | None = None
+        self.shims = shims
 
         # Serialization state
         self.buffer = BytesIO()
@@ -1078,7 +1077,8 @@ class HXSFile(Serialisable):
                 self.schemas.append(Schema().deserialise(f))
 
         self._link_and_resolve_references()
-        self._apply_type_shims(deadcells.TYPES)
+        if self.shims is not None:
+            self._apply_type_shims(shims.shims_for(self.shims))
         self.obj = self._read_root_object(f)
 
         return self

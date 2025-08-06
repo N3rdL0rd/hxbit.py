@@ -1,9 +1,12 @@
+
 from abc import ABC, abstractmethod
 from io import BytesIO
-from typing import Any, Dict, Tuple, Union, BinaryIO, Literal, TypeVar, List
+from typing import Any, Dict, Set, Tuple, Union, BinaryIO, Literal, TypeVar, List
 import struct
 import inspect
 from enum import Enum
+
+from .types import deadcells # TODO: load dynamically
 
 T = TypeVar("T", bound="VarInt")
 
@@ -45,7 +48,7 @@ def tell(message: str | None = None) -> None:
     if "f" in frame_locals:
         f = frame_locals["f"]
         print(
-            f"DEBUG: {message if message else f'{code.co_filename}:{line_number}'}:      {hex(f.tell())}"
+            f"DEBUG: {message if message else f'{code.co_filename}:{line_number}':<40} {hex(f.tell())}"
         )
     else:
         print("WARNING: tell() called without a file-like object in locals.")
@@ -710,7 +713,7 @@ class Struct(PropTypeDef):
     def serialise(self) -> bytes:
         nfields = VarInt(len(self.fields)).serialise()
         fields_data = b"".join(
-            field["name"].serialise() + field["type"].serialise()  # type: ignore
+            field["name"].serialise() + field["type"].serialise()
             for field in self.fields
         )
         return self.name.serialise() + nfields + fields_data
@@ -718,7 +721,7 @@ class Struct(PropTypeDef):
     def __repr__(self) -> str:
         fields_repr = ", ".join(
             f"{field['name'].value!r}: {field['type']}"
-            for field in self.fields  # type: ignore
+            for field in self.fields
         )
         return f"Struct(name={self.name.value!r}, fields=[{fields_repr}])"
 
@@ -830,9 +833,9 @@ class PropType(Serialisable):
 
             spaces = "  " * (indent + 1)
             fields_str = ""
-            for field in self.defn.fields:
-                field_name = field["name"].value  # type: ignore
-                field_type = field["type"].pprint(indent + 1, context=context)  # type: ignore
+            for f in self.defn.fields:
+                field_name = f["name"].value
+                field_type = f["type"].pprint(indent + 1, context=context)  # type: ignore
                 fields_str += f"\n{spaces}{field_name}: {field_type}"
 
             return (
@@ -935,10 +938,10 @@ class Obj:
         self.context = context
         self.fields: Dict[str, Any] = {}
 
-    def deserialise(self, f: BinaryIO | BytesIO):
+    def deserialise(self, f: BinaryIO | BytesIO) -> "Obj":
         """Populates the object's fields by reading from the stream according to its schema."""
         if not self.schema:
-            return
+            return self
 
         tell(
             f"Class {self.schema.classdef.name.value if self.schema.classdef else 'Unknown'}"
@@ -951,7 +954,7 @@ class Obj:
             self.fields[field_name.value] = val
         return self
     
-    def serialise(self):
+    def serialise(self) -> None:
         """Writes the object's fields to the context's buffer according to its schema."""
         if not self.schema:
             return
@@ -969,7 +972,7 @@ class Obj:
         )
         return f"<Obj class='{class_name}': {self.fields}>"
     
-    def _format_value(self, value: Any, indent: int, seen: set) -> str:
+    def _format_value(self, value: Any, indent: int, seen: Set[Any]) -> str:
         """Helper function to recursively format values for pretty-printing."""
         
         if isinstance(value, Obj):
@@ -994,7 +997,7 @@ class Obj:
         
         return str(value)
 
-    def pprint(self, indent: int = 0, seen: set | None = None) -> str:
+    def pprint(self, indent: int = 0, seen: Set[Any] | None = None) -> str:
         """
         Returns a human-readable, indented string representation of the object,
         with cycle detection to prevent infinite recursion.
@@ -1075,10 +1078,94 @@ class HXSFile(Serialisable):
                 self.schemas.append(Schema().deserialise(f))
 
         self._link_and_resolve_references()
-
+        self._apply_type_shims(deadcells.TYPES)
         self.obj = self._read_root_object(f)
 
         return self
+
+    def _create_proptype_from_shim(self, shim: Dict[str, Any]) -> PropType:
+        """Creates a PropType object from a shim dictionary definition."""
+        prop_type = PropType()
+        shim_type_str = shim.get("type")
+
+        if shim_type_str == "Int":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PInt.value)
+            prop_type.defn = Empty()
+        elif shim_type_str == "Float":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PFloat.value)
+            prop_type.defn = Empty()
+        elif shim_type_str == "Bool":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PBool.value)
+            prop_type.defn = Empty()
+        elif shim_type_str == "String":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PString.value)
+            prop_type.defn = Empty()
+        elif shim_type_str == "Array":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PArray.value)
+            type_def = TypeDef()
+            type_def.type = self._create_proptype_from_shim(shim["payload"])
+            prop_type.defn = type_def
+        elif shim_type_str == "Obj":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PObj.value)
+            obj_def = ObjDef()
+            shim_fields = shim.get("fields", {})
+            for field_name, field_shim in shim_fields.items():
+                obj_field_def = ObjFieldDef()
+                obj_field_def.name = String(field_name)
+                obj_field_def.type = self._create_proptype_from_shim(field_shim)
+                obj_field_def.opt = Boolean(True)  # Shims are for optional fields
+                obj_def.fields.append(obj_field_def)
+            prop_type.defn = obj_def
+        else:
+            raise ValueError(f"Unsupported shim type: '{shim_type_str}'")
+
+        return prop_type
+
+    def _apply_type_shims(self, shims: Dict[str, Any]) -> None:
+        """
+        Patches the parsed schemas with externally provided type definitions (shims)
+        to fill in gaps where the original schema is incomplete.
+        """
+        for schema in self.schemas:
+            if not schema.classdef or not schema.classdef.name.value:
+                continue
+            class_name = schema.classdef.name.value
+
+            for i, field_name_obj in enumerate(schema.field_names):
+                field_name = field_name_obj.value
+                shim_key = f"{class_name}.{field_name}"
+
+                if shim_key in shims:
+                    current_prop_type = schema.field_types[i]
+                    # Check if the type is PArray<PObj>
+                    is_array_of_obj = (
+                        current_prop_type.kind
+                        and current_prop_type.kind.kind == PropTypeDesc.Kind.PArray
+                        and isinstance(current_prop_type.defn, TypeDef)
+                        and current_prop_type.defn.type
+                        and current_prop_type.defn.type.kind
+                        and current_prop_type.defn.type.kind.kind
+                        == PropTypeDesc.Kind.PObj
+                        and isinstance(current_prop_type.defn.type.defn, ObjDef)
+                    )
+
+                    if not is_array_of_obj:
+                        continue
+
+                    # Check if the inner PObj has untyped fields, which is the problem we're solving.
+                    assert isinstance(current_prop_type.defn, TypeDef)
+                    obj_def = current_prop_type.defn.type.defn
+                    assert isinstance(obj_def, ObjDef)
+                    has_untyped_fields = any(f.type is None for f in obj_def.fields)
+
+                    if has_untyped_fields:
+                        # This schema is a candidate for patching.
+                        # Replace the entire PropType with a new one generated from the shim.
+                        shim_data = shims[shim_key]
+                        new_prop_type = self._create_proptype_from_shim(shim_data)
+                        
+                        # Replace the old, incomplete PropType with the new one
+                        schema.field_types[i] = new_prop_type
 
     def _is_field_nullable(self, prop_type: PropType | None) -> bool:
         """Determines if a field type is nullable according to hxbit rules."""
@@ -1141,7 +1228,7 @@ class HXSFile(Serialisable):
         kind, defn = prop_type.kind.kind, prop_type.defn
 
         if kind in [PropTypeDesc.Kind.PInt, PropTypeDesc.Kind.PFlags]: return VarInt().deserialise(f).value
-        if kind == PropTypeDesc.Kind.PFloat: return struct.unpack("<d", f.read(8))[0]
+        if kind == PropTypeDesc.Kind.PFloat: return struct.unpack("<f", f.read(4))[0]
         if kind == PropTypeDesc.Kind.PBool: return f.read(1)[0] != 0
         if kind == PropTypeDesc.Kind.PInt64: return struct.unpack("<q", f.read(8))[0]
         if kind in [PropTypeDesc.Kind.PString, PropTypeDesc.Kind.PBytes]: return String().deserialise(f).value
@@ -1176,10 +1263,15 @@ class HXSFile(Serialisable):
                     is_present = (bits & (1 << bit_idx)) != 0
                     bit_idx += 1
                 if is_present:
-                    obj_data[field_name] = self._read_value(f, field_def.type) if field_def.type else String().deserialise(f).value
-                else:
-                    obj_data[field_name] = None
+                    if field_def.type:
+                        tell(f"_read_value field {field_name}: {field_def.type.kind.kind} ") # type: ignore
+                        obj_data[field_name] = self._read_value(f, field_def.type)
+                        tell(f"value: {obj_data[field_name]}")
+                    else:
+                        tell(f"string hack {field_name}")
+                        obj_data[field_name] = String().deserialise(f).value
             return obj_data
+        
         raise NotImplementedError(f"Deserialization for {kind.name} is not implemented.")
 
     def _read_root_object(self, f: BinaryIO | BytesIO) -> "Obj | None":
@@ -1208,7 +1300,7 @@ class HXSFile(Serialisable):
         if kind in [PropTypeDesc.Kind.PInt, PropTypeDesc.Kind.PFlags]:
             self.buffer.write(VarInt(value).serialise())
         elif kind == PropTypeDesc.Kind.PFloat:
-            self.buffer.write(struct.pack("<d", value))
+            self.buffer.write(struct.pack("<f", value))
         elif kind == PropTypeDesc.Kind.PBool:
             self.buffer.write(bytes([1 if value else 0]))
         elif kind == PropTypeDesc.Kind.PInt64:
@@ -1388,8 +1480,8 @@ class HXSFile(Serialisable):
             for field in prop_type.defn.fields:
                 if field.type: self._resolve_prop_type(field.type)
         elif isinstance(prop_type.defn, Struct):
-            for field in prop_type.defn.fields:
-                if isinstance(field.get("type"), PropType): self._resolve_prop_type(field["type"])  # type: ignore
+            for f in prop_type.defn.fields:
+                if isinstance(f.get("type"), PropType): self._resolve_prop_type(field["type"])  # type: ignore
 
     def pprint_classdefs(self) -> str:
         if not self.classdefs: return "No class definitions found"

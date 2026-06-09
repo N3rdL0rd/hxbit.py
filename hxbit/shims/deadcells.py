@@ -162,5 +162,6 @@ TYPES = {
                 "to": {"type": "String"}
             }
         }
-    }
+    },
+    # TODO: Game shims
 }

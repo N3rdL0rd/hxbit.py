@@ -500,9 +500,10 @@ class PropTypeDesc(Serialisable):
         PFlags = 16
         PCustom = 17
         PSerInterface = 18
-        PStruct = 19
+        POldStruct = 19
         PAliasCDB = 20
         PNoSave = 21
+        PStruct = 22
 
     value: int
     kind: Kind
@@ -626,7 +627,6 @@ class ObjFieldDef(Serialisable):
         fbits = VarInt().deserialise(f)
 
         if fbits.value == 0:
-            self.opt.deserialise(f)
             return self
 
         val = fbits.value - 1
@@ -634,11 +634,13 @@ class ObjFieldDef(Serialisable):
         if val & 1:
             self.name = String().deserialise(f)
 
+        # Haxe serializes anonymous object fields in alphabetical order.
+        # For { name, type, opt }, the on-wire order is name, opt, type.
+        self.opt.deserialise(f)
+
         if val & 2:
             prop_type_val = PropType().deserialise(f)
             self.type = None if prop_type_val.kind is None else prop_type_val
-
-        self.opt.deserialise(f)
 
         return self
 
@@ -649,8 +651,8 @@ class ObjFieldDef(Serialisable):
                     (1 if self.name else 0) + (2 if self.type else 0) + 1
                 ).serialise(),
                 self.name.serialise() if self.name else b"",
-                self.type.serialise() if self.type else b"",
                 self.opt.serialise() if self.opt else Boolean(False).serialise(),
+                self.type.serialise() if self.type else b"",
             ]
         )
 
@@ -690,7 +692,7 @@ class ObjDef(PropTypeDef):
         return f"ObjDef(fields={self.fields})"
 
 
-class Struct(PropTypeDef):
+class OldStruct(PropTypeDef):
     name: String
     fields: List[Dict[str, Union[String, "PropType"]]]
 
@@ -698,7 +700,7 @@ class Struct(PropTypeDef):
         self.name = String()
         self.fields = []
 
-    def deserialise(self, f: BinaryIO | BytesIO) -> "Struct":
+    def deserialise(self, f: BinaryIO | BytesIO) -> "OldStruct":
         self.name.deserialise(f)
         nfields = VarInt().deserialise(f).value
         tell(f"Struct '{self.name.value}' has {nfields} fields.")
@@ -721,7 +723,7 @@ class Struct(PropTypeDef):
             f"{field['name'].value!r}: {field['type']}"
             for field in self.fields
         )
-        return f"Struct(name={self.name.value!r}, fields=[{fields_repr}])"
+        return f"OldStruct(name={self.name.value!r}, fields=[{fields_repr}])"
 
 
 class PropType(Serialisable):
@@ -745,9 +747,10 @@ class PropType(Serialisable):
         PropTypeDesc.Kind.PFlags: TypeDef,
         PropTypeDesc.Kind.PCustom: Empty,
         PropTypeDesc.Kind.PSerInterface: NameDef,
-        PropTypeDesc.Kind.PStruct: Struct,
+        PropTypeDesc.Kind.POldStruct: OldStruct,
         PropTypeDesc.Kind.PAliasCDB: TypeDef,
         PropTypeDesc.Kind.PNoSave: TypeDef,
+        PropTypeDesc.Kind.PStruct: NameDef,
     }
 
     kind: PropTypeDesc | None
@@ -825,7 +828,7 @@ class PropType(Serialisable):
                 fields_str += f"\n{spaces}{field_name}: {field_type}{optional}"
 
             return f"{kind_name}{{{fields_str}\n{'  ' * indent}}}"
-        elif isinstance(self.defn, Struct):
+        elif isinstance(self.defn, OldStruct):
             if not self.defn.fields:
                 return f"{kind_name}<{self.defn.name.value}>{{}}"
 
@@ -947,9 +950,12 @@ class Obj:
         for i, field_name in enumerate(self.schema.field_names):
             field_type = self.schema.field_types[i]
             assert field_name.value is not None
-            val = self.context._read_value(f, field_type)
-            # print(val)
-            self.fields[field_name.value] = val
+            self.context._push_read_context(field_name.value)
+            try:
+                val = self.context._read_value(f, field_type)
+                self.fields[field_name.value] = val
+            finally:
+                self.context._pop_read_context()
         return self
     
     def serialise(self) -> None:
@@ -1049,7 +1055,11 @@ class HXSFile(Serialisable):
         self.schemas = []
         self.objects = {} # Read cache
         self.obj: Obj | None = None
+        self.raw_object_data: bytes | None = None
+        self.object_parse_error: Exception | None = None
+        self.unresolved_clids: List[Dict[str, Any]] = []
         self.shims = shims
+        self._read_context: List[str] = []
 
         # Serialization state
         self.buffer = BytesIO()
@@ -1079,9 +1089,69 @@ class HXSFile(Serialisable):
         self._link_and_resolve_references()
         if self.shims is not None:
             self._apply_type_shims(shims.shims_for(self.shims))
-        self.obj = self._read_root_object(f)
+        self.raw_object_data = f.read()
+        try:
+            self.obj = self._read_root_object(BytesIO(self.raw_object_data))
+        except Exception as e:
+            self.object_parse_error = e
+            self.objects = {}
+            self.obj = None
 
         return self
+
+    def _push_read_context(self, segment: str) -> None:
+        self._read_context.append(segment)
+
+    def _pop_read_context(self) -> None:
+        if self._read_context:
+            self._read_context.pop()
+
+    def _current_read_path(self) -> str:
+        if not self._read_context:
+            return "<root>"
+        return ".".join(self._read_context)
+
+    def _peek_stream_bytes(self, f: BinaryIO | BytesIO, radius: int = 16) -> str | None:
+        if not isinstance(f, BytesIO):
+            return None
+        pos = f.tell()
+        data = f.getbuffer()
+        start = max(0, pos - radius)
+        end = min(len(data), pos + radius)
+        return bytes(data[start:end]).hex(" ")
+
+    def _record_unresolved_clid(
+        self,
+        clid: int,
+        declared_schema: "Schema | None",
+        f: BinaryIO | BytesIO,
+    ) -> None:
+        declared_name = None
+        if declared_schema is not None and declared_schema.classdef is not None:
+            declared_name = declared_schema.classdef.name.value
+        self.unresolved_clids.append(
+            {
+                "clid": clid,
+                "path": self._current_read_path(),
+                "declared_schema": declared_name,
+                "offset": f.tell(),
+                "nearby_bytes": self._peek_stream_bytes(f),
+            }
+        )
+
+    def pprint_unresolved_clids(self) -> str:
+        if not self.unresolved_clids:
+            return "No unresolved runtime CLIDs recorded."
+        lines = ["Unresolved runtime CLIDs:"]
+        for item in self.unresolved_clids:
+            declared = item["declared_schema"] or "<unknown>"
+            lines.append(
+                f"  CLID {item['clid']} at {item['path']} "
+                f"(declared schema: {declared}, offset: 0x{item['offset']:x})"
+            )
+            if item["nearby_bytes"]:
+                lines.append(f"    bytes: {item['nearby_bytes']}")
+        return "\n".join(lines)
 
     def _create_proptype_from_shim(self, shim: Dict[str, Any]) -> PropType:
         """Creates a PropType object from a shim dictionary definition."""
@@ -1235,21 +1305,47 @@ class HXSFile(Serialisable):
         if kind == PropTypeDesc.Kind.PArray and isinstance(defn, TypeDef):
             count = VarInt().deserialise(f).value
             if count == 0: return None
-            return [self._read_value(f, defn.type) for _ in range(count - 1)]
+            values = []
+            for i in range(count - 1):
+                self._push_read_context(f"[{i}]")
+                try:
+                    values.append(self._read_value(f, defn.type))
+                finally:
+                    self._pop_read_context()
+            return values
         if kind == PropTypeDesc.Kind.PMap and isinstance(defn, MapDef):
             count = VarInt().deserialise(f).value
             if count == 0: return None
-            return { self._read_value(f, defn.key_type): self._read_value(f, defn.value_type) for _ in range(count - 1)}
+            values = {}
+            for i in range(count - 1):
+                self._push_read_context(f"<key:{i}>")
+                try:
+                    key = self._read_value(f, defn.key_type)
+                finally:
+                    self._pop_read_context()
+                self._push_read_context(f"[{key!r}]")
+                try:
+                    values[key] = self._read_value(f, defn.value_type)
+                finally:
+                    self._pop_read_context()
+            return values
         if kind == PropTypeDesc.Kind.PSerializable and isinstance(defn, NameDef):
-            assert defn.name.value is not None
-            _, schema = self.get_class_by_name(defn.name.value)
+            schema = self._get_schema_by_name(defn.name.value)
             return self._read_ref(f, schema)
+        if kind == PropTypeDesc.Kind.PSerInterface:
+            return self._read_ref(f, None)
         if kind == PropTypeDesc.Kind.PEnum and isinstance(defn, NameDef):
-            # For now, just read the constructor index
-            return f"Enum<{defn.name.value}>({VarInt().deserialise(f).value})"
+            constructor = f.read(1)[0]
+            if constructor == 0:
+                return None
+            return f"Enum<{defn.name.value}>({constructor - 1})"
         if kind == PropTypeDesc.Kind.PNull and isinstance(defn, TypeDef):
             return self._read_value(f, defn.type) if f.read(1)[0] != 0 else None
         if kind == PropTypeDesc.Kind.PAlias and isinstance(defn, TypeDef):
+            return self._read_value(f, defn.type)
+        if kind == PropTypeDesc.Kind.PAliasCDB and isinstance(defn, TypeDef):
+            return self._read_value(f, defn.type)
+        if kind == PropTypeDesc.Kind.PNoSave and isinstance(defn, TypeDef):
             return self._read_value(f, defn.type)
         if kind == PropTypeDesc.Kind.PObj and isinstance(defn, ObjDef):
             bits = VarInt().deserialise(f).value
@@ -1275,18 +1371,19 @@ class HXSFile(Serialisable):
         raise NotImplementedError(f"Deserialization for {kind.name} is not implemented.")
 
     def _read_root_object(self, f: BinaryIO | BytesIO) -> "Obj | None":
-        schema = self.schemas[0]
         uid_val = VarInt().deserialise(f).value
         if uid_val == 0: return None
+        schema = self._resolve_runtime_schema(f, self.schemas[0])
         obj = Obj(schema, self)
         self.objects[uid_val] = obj
         obj.deserialise(f)
         return obj
 
-    def _read_ref(self, f: BinaryIO | BytesIO, schema: Schema) -> "Obj | None":
+    def _read_ref(self, f: BinaryIO | BytesIO, schema: "Schema | None") -> "Obj | None":
         uid_val = VarInt().deserialise(f).value
         if uid_val == 0: return None
         if uid_val in self.objects: return self.objects[uid_val]
+        schema = self._resolve_runtime_schema(f, schema)
         obj = Obj(schema, self)
         self.objects[uid_val] = obj
         obj.deserialise(f)
@@ -1407,11 +1504,14 @@ class HXSFile(Serialisable):
         self.written_objects = {}
         self.next_uid = 1
 
-        # Write the object data first to a temporary buffer
-        if self.obj:
-            self._write_ref(self.obj)
-        
-        object_data = self.buffer.getvalue()
+        # Write the object data first to a temporary buffer, unless we had to
+        # preserve an opaque payload because typed deserialization failed.
+        if self.raw_object_data is not None:
+            object_data = self.raw_object_data
+        else:
+            if self.obj:
+                self._write_ref(self.obj)
+            object_data = self.buffer.getvalue()
         
         # Now, build the final file with the header and object data
         final_buffer = BytesIO()
@@ -1479,9 +1579,10 @@ class HXSFile(Serialisable):
         elif isinstance(prop_type.defn, ObjDef):
             for field in prop_type.defn.fields:
                 if field.type: self._resolve_prop_type(field.type)
-        elif isinstance(prop_type.defn, Struct):
+        elif isinstance(prop_type.defn, OldStruct):
             for f in prop_type.defn.fields:
-                if isinstance(f.get("type"), PropType): self._resolve_prop_type(field["type"])  # type: ignore
+                if isinstance(f.get("type"), PropType):
+                    self._resolve_prop_type(f["type"])  # type: ignore[index]
 
     def pprint_classdefs(self) -> str:
         if not self.classdefs: return "No class definitions found"
@@ -1498,3 +1599,40 @@ class HXSFile(Serialisable):
                 else:
                     raise IndexError( f"Found ClassDef for '{name}' at index {i}, but no corresponding Schema exists.")
         raise ValueError(f"Class with name '{name}' not found.")
+
+    def _get_schema_by_name(self, name: str | None) -> "Schema | None":
+        if name is None:
+            return None
+        try:
+            _, schema = self.get_class_by_name(name)
+            return schema
+        except ValueError:
+            return None
+
+    def _get_schema_by_clid(self, clid: int) -> "Schema":
+        for i, class_def in enumerate(self.classdefs):
+            if class_def.clid.value == clid:
+                return self.schemas[i]
+        raise ValueError(f"Schema with CLID '{clid}' not found.")
+
+    def _resolve_runtime_schema(
+        self, f: BinaryIO | BytesIO, declared_schema: "Schema | None"
+    ) -> "Schema":
+        if declared_schema is not None and declared_schema.clid.value != 0:
+            return declared_schema
+
+        runtime_clid = CLID().deserialise(f)
+        try:
+            return self._get_schema_by_clid(runtime_clid.value)
+        except ValueError as e:
+            self._record_unresolved_clid(runtime_clid.value, declared_schema, f)
+            declared_name = None
+            if declared_schema is not None and declared_schema.classdef is not None:
+                declared_name = declared_schema.classdef.name.value
+            path = self._current_read_path()
+            detail = (
+                f"Schema with CLID '{runtime_clid.value}' not found "
+                f"at {path} (declared schema: {declared_name or '<unknown>'}, "
+                f"offset: 0x{f.tell():x})"
+            )
+            raise ValueError(detail) from e

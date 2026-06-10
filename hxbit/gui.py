@@ -1,11 +1,96 @@
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict
 
 from .core import HXSFile, Obj
+
+if os.name == "nt":
+    from hidpi_tk import DPIAwareTk
+else:
+    DPIAwareTk = tk.Tk
+
+
+def _fix_hidpi_linux(root: tk.Tk) -> float:
+    """Scale Tk fonts and widget sizing to match the screen's actual DPI.
+
+    Tk defaults to assuming 96 DPI on X11/Wayland, which looks tiny on HiDPI
+    displays. ``HXBIT_UI_SCALE`` can be set to override the detected scaling
+    factor for setups where the reported DPI is wrong.
+
+    Returns the scaling factor that was applied (1.0 if none).
+    """
+    override = os.environ.get("HXBIT_UI_SCALE")
+    if override:
+        try:
+            scaling = float(override)
+        except ValueError:
+            scaling = 1.0
+    else:
+        # Tk's own DPI guess (winfo_fpixels) relies on the X server's
+        # configured Xft.dpi, which is often left at the 96 default even on
+        # HiDPI screens. Cross-check against the screen's physical size,
+        # which X11/Wayland usually report correctly from the monitor's EDID.
+        scaling = root.winfo_fpixels("1i") / 72.0
+
+        mm_w, mm_h = root.winfo_screenmmwidth(), root.winfo_screenmmheight()
+        if mm_w > 0 and mm_h > 0:
+            px_w, px_h = root.winfo_screenwidth(), root.winfo_screenheight()
+            physical_dpi = ((px_w / (mm_w / 25.4)) + (px_h / (mm_h / 25.4))) / 2
+            scaling = max(scaling, physical_dpi / 72.0)
+
+    if scaling <= 1.01:
+        return 1.0
+
+    root.tk.call("tk", "scaling", scaling)
+
+    # "tk scaling" mainly affects ttk theme metrics specified in points
+    # (hence borders/padding growing). Named fonts realized at startup don't
+    # reliably re-render bigger just from a scaling change, so force their
+    # pixel size directly: negative size = literal pixels, so this bypasses
+    # any point->pixel conversion entirely.
+    import tkinter.font
+
+    available = {f.lower() for f in tkinter.font.families(root)}
+
+    def _pick(*preferred: str) -> str | None:
+        for fam in preferred:
+            if fam.lower() in available:
+                return fam
+        return None
+
+    sans_fallback = _pick("DejaVu Sans", "Liberation Sans", "Noto Sans", "Helvetica", "Arial")
+    mono_fallback = _pick("DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Courier New", "Courier")
+
+    for name in tkinter.font.names(root):
+        font = tkinter.font.Font(root=root, name=name, exists=True)
+        size = int(font["size"])
+        px = -size if size < 0 else round(size * 96 / 72)
+        new_size = -round(px * scaling)
+        if font.actual("family").lower() == "fixed":
+            # Some minimal X setups fall back to the legacy "fixed" bitmap
+            # font, which ignores size requests entirely. Swap to a
+            # scalable family so the size change actually takes effect.
+            fallback = mono_fallback if "fixed" in name.lower() else sans_fallback
+            if fallback:
+                font.configure(family=fallback, size=new_size)
+            else:
+                font["size"] = new_size
+        else:
+            font["size"] = new_size
+
+    # ttk.Treeview's row height is a fixed pixel value baked into the theme
+    # at its original 96dpi assumption, so it doesn't grow with the font and
+    # rows start overlapping. Resize it to fit the now-larger default font.
+    default_font = tkinter.font.nametofont("TkDefaultFont")
+    row_height = default_font.metrics("linespace") + round(4 * scaling)
+    style = ttk.Style(root)
+    style.configure("Treeview", rowheight=row_height)
+
+    return scaling
 
 
 ScalarTypeName = str
@@ -45,11 +130,14 @@ def _value_summary(value: Any) -> str:
     return str(value)
 
 
-class HXSFileEditor(tk.Tk):
+class HXSFileEditor(DPIAwareTk):
     def __init__(self, initial_path: str | None = None, initial_shims: str = "deadcells"):
         super().__init__()
+        scaling = 1.0
+        if os.name != "nt":
+            scaling = _fix_hidpi_linux(self)
         self.title("hxbit editor")
-        self.geometry("1200x800")
+        self.geometry(f"{round(1200 * scaling)}x{round(800 * scaling)}")
 
         self.current_path: Path | None = None
         self.current_file: HXSFile | None = None

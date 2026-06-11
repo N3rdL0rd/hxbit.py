@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Reimplementation of Haxe's hxbit in Python for manipulating serialised Haxe classes."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "crashlink[extras]",
+    "hidpi-tk>=1.4.0",
+]
 
 scripts.hxbit = "hxbit.__main__:main"
 
@@ -14,6 +17,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+crashlink = { git = "https://github.com/N3rdL0rd/crashlink" }
 
 [dependency-groups]
 dev = [

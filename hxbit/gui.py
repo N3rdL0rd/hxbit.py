@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import reprlib
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -123,8 +124,10 @@ def _value_summary(value: Any) -> str:
         return f"{len(value)} entries"
     if isinstance(value, list):
         return f"{len(value)} items"
+    if isinstance(value, bytes):
+        return f"{len(value)} bytes"
     if isinstance(value, str):
-        return value
+        return value if len(value) <= 200 else value[:200] + "…"
     if value is None:
         return "None"
     return str(value)
@@ -216,6 +219,7 @@ class HXSFileEditor(DPIAwareTk):
         self.object_tree.column("value", width=320, stretch=True)
         self.object_tree.grid(row=0, column=0, sticky="nsew")
         self.object_tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.object_tree.bind("<<TreeviewOpen>>", self.on_tree_open)
 
         object_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.object_tree.yview)
         object_scroll.grid(row=0, column=1, sticky="ns")
@@ -369,112 +373,93 @@ class HXSFileEditor(DPIAwareTk):
             values=(_value_kind(hxs.obj), _value_summary(hxs.obj)),
             open=True,
         )
-        self.node_meta[root_id] = {"value": hxs.obj, "container": None, "key": None, "path": root_name}
-        self._populate_tree(root_id, hxs.obj, root_name, ancestors={id(hxs.obj)})
+        self.node_meta[root_id] = {
+            "value": hxs.obj,
+            "container": None,
+            "key": None,
+            "path": root_name,
+            "ancestors": frozenset({id(hxs.obj)}),
+            "populated": False,
+        }
+        self._populate_children(root_id)
         self.object_tree.selection_set(root_id)
         self.object_tree.focus(root_id)
         self.on_tree_select()
 
-    def _populate_tree(
-        self,
-        parent: str,
-        value: Any,
-        path: str,
-        ancestors: set[int] | None = None,
-    ) -> None:
-        if ancestors is None:
-            ancestors = set()
+    # The object graph is heavily cross-linked (thousands of objects, where
+    # e.g. every entity points back at the level and the level at every
+    # entity), so eagerly expanding it into the tree explodes combinatorially.
+    # Children are therefore only materialized when a node is opened, with a
+    # placeholder child standing in until then.
+    _PLACEHOLDER_TEXT = "…"
 
+    @staticmethod
+    def _is_expandable(value: Any) -> bool:
         if isinstance(value, Obj):
-            for key, child in value.fields.items():
-                child_path = f"{path}.{key}"
-                child_ancestors = set(ancestors)
-                is_cycle = isinstance(child, (Obj, dict, list)) and id(child) in ancestors
-                child_id = self.object_tree.insert(
-                    parent,
-                    "end",
-                    text=key,
-                    values=(
-                        _value_kind(child),
-                        "<circular reference>" if is_cycle else _value_summary(child),
-                    ),
-                    open=False,
-                )
-                self.node_meta[child_id] = {
-                    "value": child,
-                    "container": value.fields,
-                    "key": key,
-                    "path": child_path,
-                    "is_cycle": is_cycle,
-                }
-                if not is_cycle:
-                    if isinstance(child, (Obj, dict, list)):
-                        child_ancestors.add(id(child))
-                    self._populate_tree(child_id, child, child_path, child_ancestors)
-            return
+            return bool(value.fields)
+        if isinstance(value, (dict, list)):
+            return bool(value)
+        return False
 
+    def _iter_children(self, value: Any) -> list[tuple[str, str, Any, Any]]:
+        """Yields (label, path_suffix, key, child) for one level of `value`."""
+        if isinstance(value, Obj):
+            return [(key, f".{key}", key, child) for key, child in value.fields.items()]
         if isinstance(value, dict):
-            for key, child in value.items():
-                label = repr(key)
-                child_path = f"{path}[{label}]"
-                child_ancestors = set(ancestors)
-                is_cycle = isinstance(child, (Obj, dict, list)) and id(child) in ancestors
-                child_id = self.object_tree.insert(
-                    parent,
-                    "end",
-                    text=label,
-                    values=(
-                        _value_kind(child),
-                        "<circular reference>" if is_cycle else _value_summary(child),
-                    ),
-                    open=False,
-                )
-                self.node_meta[child_id] = {
-                    "value": child,
-                    "container": value,
-                    "key": key,
-                    "path": child_path,
-                    "is_cycle": is_cycle,
-                }
-                if not is_cycle:
-                    if isinstance(child, (Obj, dict, list)):
-                        child_ancestors.add(id(child))
-                    self._populate_tree(child_id, child, child_path, child_ancestors)
-            return
-
+            return [(repr(key), f"[{key!r}]", key, child) for key, child in value.items()]
         if isinstance(value, list):
-            for index, child in enumerate(value):
-                label = f"[{index}]"
-                child_path = f"{path}{label}"
-                child_ancestors = set(ancestors)
-                is_cycle = isinstance(child, (Obj, dict, list)) and id(child) in ancestors
-                child_id = self.object_tree.insert(
-                    parent,
-                    "end",
-                    text=label,
-                    values=(
-                        _value_kind(child),
-                        "<circular reference>" if is_cycle else _value_summary(child),
-                    ),
-                    open=False,
-                )
-                self.node_meta[child_id] = {
-                    "value": child,
-                    "container": value,
-                    "key": index,
-                    "path": child_path,
-                    "is_cycle": is_cycle,
-                }
-                if not is_cycle:
-                    if isinstance(child, (Obj, dict, list)):
-                        child_ancestors.add(id(child))
-                    self._populate_tree(child_id, child, child_path, child_ancestors)
+            return [(f"[{i}]", f"[{i}]", i, child) for i, child in enumerate(value)]
+        return []
+
+    def _populate_children(self, parent: str) -> None:
+        meta = self.node_meta[parent]
+        if meta.get("populated") or meta.get("is_cycle"):
+            return
+        meta["populated"] = True
+        for placeholder in self.object_tree.get_children(parent):
+            if placeholder not in self.node_meta:
+                self.object_tree.delete(placeholder)
+
+        value = meta["value"]
+        ancestors: frozenset[int] = meta["ancestors"]
+        container = value.fields if isinstance(value, Obj) else value
+        for label, suffix, key, child in self._iter_children(value):
+            is_container = isinstance(child, (Obj, dict, list))
+            is_cycle = is_container and id(child) in ancestors
+            child_id = self.object_tree.insert(
+                parent,
+                "end",
+                text=label,
+                values=(
+                    _value_kind(child),
+                    "<circular reference>" if is_cycle else _value_summary(child),
+                ),
+                open=False,
+            )
+            self.node_meta[child_id] = {
+                "value": child,
+                "container": container,
+                "key": key,
+                "path": meta["path"] + suffix,
+                "is_cycle": is_cycle,
+                "ancestors": ancestors | {id(child)} if is_container else ancestors,
+                "populated": False,
+            }
+            if not is_cycle and self._is_expandable(child):
+                self.object_tree.insert(child_id, "end", text=self._PLACEHOLDER_TEXT)
+
+    def on_tree_open(self, _event: tk.Event | None = None) -> None:
+        item_id = self.object_tree.focus()
+        if item_id in self.node_meta:
+            self._populate_children(item_id)
 
     def on_tree_select(self, _event: tk.Event | None = None) -> None:
         selected = self.object_tree.selection()
         if not selected:
             return
         item_id = selected[0]
+        if item_id not in self.node_meta:  # lazy-expansion placeholder
+            return
         self.selected_item = item_id
         meta = self.node_meta[item_id]
         value = meta["value"]
@@ -492,11 +477,15 @@ class HXSFileEditor(DPIAwareTk):
             return
         if isinstance(value, Obj):
             lines.append("")
-            lines.append(value.pprint())
+            detail = value.pprint()
+            if len(detail) > 200_000:
+                detail = detail[:200_000] + "\n… (truncated; expand the tree to inspect nested values)"
+            lines.append(detail)
             self._set_editor_enabled(False)
         elif isinstance(value, (dict, list)):
             lines.append("")
-            lines.append(repr(value))
+            # Bounded repr: shared sub-objects make a full repr explode.
+            lines.append(reprlib.Repr(maxlevel=3, maxdict=20, maxlist=20, maxstring=120, maxother=120).repr(value))
             self._set_editor_enabled(False)
         else:
             lines.append("")

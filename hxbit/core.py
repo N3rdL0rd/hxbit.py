@@ -1055,10 +1055,12 @@ class HXSFile(Serialisable):
         self.schemas = []
         self.objects = {} # Read cache
         self.obj: Obj | None = None
+        self.roots: List["Obj"] = []
         self.raw_object_data: bytes | None = None
         self.object_parse_error: Exception | None = None
         self.unresolved_clids: List[Dict[str, Any]] = []
         self.shims = shims
+        self.enum_shims: Dict[str, Any] = {}
         self._read_context: List[str] = []
 
         # Serialization state
@@ -1089,6 +1091,7 @@ class HXSFile(Serialisable):
         self._link_and_resolve_references()
         if self.shims is not None:
             self._apply_type_shims(shims.shims_for(self.shims))
+            self.enum_shims = shims.enums_for(self.shims)
         self.raw_object_data = f.read()
         try:
             self.obj = self._read_root_object(BytesIO(self.raw_object_data))
@@ -1172,6 +1175,21 @@ class HXSFile(Serialisable):
             prop_type.defn = Empty()
         elif shim_type_str == "Array":
             prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PArray.value)
+            type_def = TypeDef()
+            type_def.type = self._create_proptype_from_shim(shim["payload"])
+            prop_type.defn = type_def
+        elif shim_type_str == "Enum":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PEnum.value)
+            name_def = NameDef()
+            name_def.name = String(shim["name"])
+            prop_type.defn = name_def
+        elif shim_type_str == "Serializable":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PSerializable.value)
+            name_def = NameDef()
+            name_def.name = String(shim["name"])
+            prop_type.defn = name_def
+        elif shim_type_str == "Null":
+            prop_type.kind = PropTypeDesc(PropTypeDesc.Kind.PNull.value)
             type_def = TypeDef()
             type_def.type = self._create_proptype_from_shim(shim["payload"])
             prop_type.defn = type_def
@@ -1301,8 +1319,12 @@ class HXSFile(Serialisable):
         if kind == PropTypeDesc.Kind.PFloat: return struct.unpack("<f", f.read(4))[0]
         if kind == PropTypeDesc.Kind.PBool: return f.read(1)[0] != 0
         if kind == PropTypeDesc.Kind.PInt64: return struct.unpack("<q", f.read(8))[0]
-        if kind in [PropTypeDesc.Kind.PString, PropTypeDesc.Kind.PBytes]: return String().deserialise(f).value
-        if kind == PropTypeDesc.Kind.PArray and isinstance(defn, TypeDef):
+        if kind == PropTypeDesc.Kind.PString: return String().deserialise(f).value
+        if kind == PropTypeDesc.Kind.PBytes:
+            length = VarInt().deserialise(f).value
+            if length == 0: return None
+            return f.read(length - 1)
+        if kind in [PropTypeDesc.Kind.PArray, PropTypeDesc.Kind.PVector] and isinstance(defn, TypeDef):
             count = VarInt().deserialise(f).value
             if count == 0: return None
             values = []
@@ -1338,7 +1360,27 @@ class HXSFile(Serialisable):
             constructor = f.read(1)[0]
             if constructor == 0:
                 return None
-            return f"Enum<{defn.name.value}>({constructor - 1})"
+            index = constructor - 1
+            enum_name = defn.name.value
+            ctors = self.enum_shims.get(enum_name) if enum_name else None
+            if ctors and index < len(ctors) and ctors[index]["args"]:
+                ctor = ctors[index]
+                args = []
+                for j, arg_shim in enumerate(ctor["args"]):
+                    self._push_read_context(f"{enum_name}.{ctor['name']}<arg{j}>")
+                    try:
+                        args.append(
+                            self._read_value(f, self._create_proptype_from_shim(arg_shim))
+                        )
+                    finally:
+                        self._pop_read_context()
+                return {
+                    "__enum__": enum_name,
+                    "constructor": index,
+                    "name": ctor["name"],
+                    "args": args,
+                }
+            return f"Enum<{enum_name}>({index})"
         if kind == PropTypeDesc.Kind.PNull and isinstance(defn, TypeDef):
             return self._read_value(f, defn.type) if f.read(1)[0] != 0 else None
         if kind == PropTypeDesc.Kind.PAlias and isinstance(defn, TypeDef):
@@ -1371,13 +1413,69 @@ class HXSFile(Serialisable):
         raise NotImplementedError(f"Deserialization for {kind.name} is not implemented.")
 
     def _read_root_object(self, f: BinaryIO | BytesIO) -> "Obj | None":
-        uid_val = VarInt().deserialise(f).value
-        if uid_val == 0: return None
-        schema = self._resolve_runtime_schema(f, self.schemas[0])
-        obj = Obj(schema, self)
-        self.objects[uid_val] = obj
-        obj.deserialise(f)
-        return obj
+        # The root class is not stored in the file: the game passes it to
+        # hxbit's unserializer. A file may also contain several root objects
+        # back to back (e.g. Dead Cells' "UserAndGameData"). For each root,
+        # try every schema and keep the one that consumes the most data,
+        # preferring one that reaches the end of the buffer.
+        total = len(f.getbuffer()) if isinstance(f, BytesIO) else None
+        roots: List[Obj] = []
+        saved_objects: Dict[int, Obj] = {}
+
+        while True:
+            uid_val = VarInt().deserialise(f).value
+            if uid_val == 0:
+                break
+            start = f.tell()
+
+            def attempt(schema: "Schema") -> "Obj":
+                f.seek(start)
+                self.objects = dict(saved_objects)
+                self._read_context = []
+                self.unresolved_clids = []
+                resolved = self._resolve_runtime_schema(f, schema)
+                obj = Obj(resolved, self)
+                self.objects[uid_val] = obj
+                obj.deserialise(f)
+                return obj
+
+            chosen: Obj | None = None
+            best_schema: "Schema | None" = None
+            best_pos = -1
+            best_err: Exception | None = None
+            best_err_pos = -1
+            for schema in self.schemas:
+                try:
+                    obj = attempt(schema)
+                except Exception as e:
+                    if f.tell() > best_err_pos:
+                        best_err_pos = f.tell()
+                        best_err = e
+                    continue
+                if total is None or f.tell() == total:
+                    chosen = obj
+                    break
+                if f.tell() > best_pos:
+                    best_pos = f.tell()
+                    best_schema = schema
+            if chosen is None:
+                if best_schema is not None:
+                    chosen = attempt(best_schema)
+                elif best_err is not None:
+                    raise best_err
+                else:
+                    raise ValueError("No schema produced a valid root object parse.")
+            if f.tell() == start:
+                raise ValueError(
+                    f"Root object parse made no progress at offset 0x{start:x}."
+                )
+            roots.append(chosen)
+            saved_objects = self.objects
+            if total is None or f.tell() >= total:
+                break
+
+        self.roots = roots
+        return roots[0] if roots else None
 
     def _read_ref(self, f: BinaryIO | BytesIO, schema: "Schema | None") -> "Obj | None":
         uid_val = VarInt().deserialise(f).value
@@ -1402,10 +1500,16 @@ class HXSFile(Serialisable):
             self.buffer.write(bytes([1 if value else 0]))
         elif kind == PropTypeDesc.Kind.PInt64:
             self.buffer.write(struct.pack("<q", value))
-        elif kind in [PropTypeDesc.Kind.PString, PropTypeDesc.Kind.PBytes]:
+        elif kind == PropTypeDesc.Kind.PString:
             self.buffer.write(String(value).serialise())
+        elif kind == PropTypeDesc.Kind.PBytes:
+            if value is None:
+                self.buffer.write(VarInt(0).serialise())
+            else:
+                self.buffer.write(VarInt(len(value) + 1).serialise())
+                self.buffer.write(value)
         
-        elif kind == PropTypeDesc.Kind.PArray and isinstance(defn, TypeDef):
+        elif kind in [PropTypeDesc.Kind.PArray, PropTypeDesc.Kind.PVector] and isinstance(defn, TypeDef):
             if value is None:
                 self.buffer.write(VarInt(0).serialise())
             else:
@@ -1455,10 +1559,18 @@ class HXSFile(Serialisable):
                             self.buffer.write(String(field_value).serialise())
 
         elif kind == PropTypeDesc.Kind.PEnum:
-            # "Enum<Name>(123)"
-            if isinstance(value, str) and value.endswith(')'):
+            if value is None:
+                self.buffer.write(b'\x00')
+            elif isinstance(value, dict) and "__enum__" in value:
+                self.buffer.write(bytes([value["constructor"] + 1]))
+                ctors = self.enum_shims.get(value["__enum__"]) or []
+                ctor = ctors[value["constructor"]]
+                for arg_shim, arg_value in zip(ctor["args"], value["args"]):
+                    self._write_value(self._create_proptype_from_shim(arg_shim), arg_value)
+            elif isinstance(value, str) and value.endswith(')'):
+                # "Enum<Name>(123)" — stored index is constructor + 1
                 num_str = value.split('(')[-1][:-1]
-                self.buffer.write(VarInt(int(num_str)).serialise())
+                self.buffer.write(bytes([int(num_str) + 1]))
             else: # Fallback for unknown enum format
                 print("WARNING: enum fallback format")
                 self.buffer.write(VarInt(0).serialise())
@@ -1535,15 +1647,15 @@ class HXSFile(Serialisable):
         return final_buffer.getvalue()
 
     @classmethod
-    def from_path(cls, path: str) -> "HXSFile":
+    def from_path(cls, path: str, shims: str | None = None) -> "HXSFile":
         with open(path, "rb") as f:
-            instance = cls().deserialise(f)
+            instance = cls(shims=shims).deserialise(f)
         return instance
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "HXSFile":
+    def from_bytes(cls, data: bytes, shims: str | None = None) -> "HXSFile":
         with BytesIO(data) as f:
-            instance = cls().deserialise(f)
+            instance = cls(shims=shims).deserialise(f)
         return instance
 
     def pprint_schemas(self) -> str:
@@ -1609,9 +1721,23 @@ class HXSFile(Serialisable):
         except ValueError:
             return None
 
+    @staticmethod
+    def clid_hash(name: str) -> int:
+        """hxbit's runtime class id: a 16-bit-ish hash of the class name.
+
+        Runtime refs to polymorphic classes store this hash, NOT the 2-byte
+        value in the ClassDef header (which is the class's index in the
+        game's hxbit.Serializer.CLASSES list).
+        """
+        v = 1
+        for ch in name:
+            v = (v * 223 + ord(ch)) & 0xFFFFFFFF
+        return 1 + ((v & 0x3FFFFFFF) % 65423)
+
     def _get_schema_by_clid(self, clid: int) -> "Schema":
         for i, class_def in enumerate(self.classdefs):
-            if class_def.clid.value == clid:
+            name = class_def.name.value
+            if name is not None and self.clid_hash(name) == clid:
                 return self.schemas[i]
         raise ValueError(f"Schema with CLID '{clid}' not found.")
 

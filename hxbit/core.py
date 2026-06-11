@@ -969,12 +969,15 @@ class Obj:
             self.context._write_value(field_type, value)
 
     def __repr__(self) -> str:
+        # Deliberately shallow: the object graph is densely cross-linked, so
+        # recursing into self.fields here blows up combinatorially (use
+        # pprint() for a deep, cycle-safe dump).
         class_name = (
             self.schema.classdef.name.value
             if self.schema and self.schema.classdef
             else "Unknown"
         )
-        return f"<Obj class='{class_name}': {self.fields}>"
+        return f"<Obj class='{class_name}' ({len(self.fields)} fields)>"
     
     def _format_value(self, value: Any, indent: int, seen: Set[Any]) -> str:
         """Helper function to recursively format values for pretty-printing."""

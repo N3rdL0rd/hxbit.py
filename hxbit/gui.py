@@ -411,19 +411,38 @@ class HXSFileEditor(DPIAwareTk):
             return [(f"[{i}]", f"[{i}]", i, child) for i, child in enumerate(value)]
         return []
 
+    # Large containers (e.g. a level's 48k-entry collision grid) are inserted
+    # in chunks: bulk Treeview inserts degrade badly past a few thousand rows.
+    _CHUNK_SIZE = 500
+
     def _populate_children(self, parent: str) -> None:
         meta = self.node_meta[parent]
         if meta.get("populated") or meta.get("is_cycle"):
             return
         meta["populated"] = True
+        meta["children_list"] = self._iter_children(meta["value"])
+        meta["next_index"] = 0
         for placeholder in self.object_tree.get_children(parent):
             if placeholder not in self.node_meta:
                 self.object_tree.delete(placeholder)
+        self._insert_next_chunk(parent)
+
+    def _insert_next_chunk(self, parent: str) -> None:
+        meta = self.node_meta[parent]
+        children = meta.get("children_list")
+        if not children:
+            return
+        more_id = meta.pop("more_id", None)
+        if more_id is not None:
+            self.node_meta.pop(more_id, None)
+            self.object_tree.delete(more_id)
 
         value = meta["value"]
         ancestors: frozenset[int] = meta["ancestors"]
         container = value.fields if isinstance(value, Obj) else value
-        for label, suffix, key, child in self._iter_children(value):
+        start = meta["next_index"]
+        end = min(start + self._CHUNK_SIZE, len(children))
+        for label, suffix, key, child in children[start:end]:
             is_container = isinstance(child, (Obj, dict, list))
             is_cycle = is_container and id(child) in ancestors
             child_id = self.object_tree.insert(
@@ -447,6 +466,18 @@ class HXSFileEditor(DPIAwareTk):
             }
             if not is_cycle and self._is_expandable(child):
                 self.object_tree.insert(child_id, "end", text=self._PLACEHOLDER_TEXT)
+        meta["next_index"] = end
+
+        remaining = len(children) - end
+        if remaining > 0:
+            more_id = self.object_tree.insert(
+                parent,
+                "end",
+                text=f"… {remaining:,} more (click to load)",
+                values=("", ""),
+            )
+            self.node_meta[more_id] = {"more_for": parent}
+            meta["more_id"] = more_id
 
     def on_tree_open(self, _event: tk.Event | None = None) -> None:
         item_id = self.object_tree.focus()
@@ -460,8 +491,11 @@ class HXSFileEditor(DPIAwareTk):
         item_id = selected[0]
         if item_id not in self.node_meta:  # lazy-expansion placeholder
             return
-        self.selected_item = item_id
         meta = self.node_meta[item_id]
+        if "more_for" in meta:  # pagination row: load the next chunk
+            self._insert_next_chunk(meta["more_for"])
+            return
+        self.selected_item = item_id
         value = meta["value"]
 
         lines = [

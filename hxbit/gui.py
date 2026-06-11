@@ -5,7 +5,7 @@ import reprlib
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from .core import HXSFile, Obj
 
@@ -94,6 +94,18 @@ def _fix_hidpi_linux(root: tk.Tk) -> float:
     return scaling
 
 
+def apply_platform_scaling(root: tk.Tk) -> float:
+    """Apply HiDPI scaling to a Tk root window on platforms that need it.
+
+    Public hook for tools embedding hxbit widgets (e.g. savetool). On Windows
+    callers should use ``DPIAwareTk`` as their root class instead; this is a
+    no-op there. Returns the scaling factor applied (1.0 if none).
+    """
+    if os.name != "nt":
+        return _fix_hidpi_linux(root)
+    return 1.0
+
+
 ScalarTypeName = str
 
 
@@ -133,82 +145,56 @@ def _value_summary(value: Any) -> str:
     return str(value)
 
 
-class HXSFileEditor(DPIAwareTk):
-    def __init__(self, initial_path: str | None = None, initial_shims: str = "deadcells"):
-        super().__init__()
-        scaling = 1.0
-        if os.name != "nt":
-            scaling = _fix_hidpi_linux(self)
-        self.title("hxbit editor")
-        self.geometry(f"{round(1200 * scaling)}x{round(800 * scaling)}")
+class HXSTreeFrame(ttk.Frame):
+    """An embeddable object-tree browser/editor for a parsed `HXSFile`.
 
-        self.current_path: Path | None = None
-        self.current_file: HXSFile | None = None
+    Shows every root object of the file in a lazily-expanded tree with a
+    detail pane and a scalar editor. Embed it anywhere (it is a plain
+    ttk.Frame) and call `load(hxs)`; pass `on_status` to receive one-line
+    status messages (e.g. "Applied edit"), and `on_edit` to be notified when
+    the user modifies a value.
+    """
+
+    # The object graph is heavily cross-linked (thousands of objects, where
+    # e.g. every entity points back at the level and the level at every
+    # entity), so eagerly expanding it into the tree explodes combinatorially.
+    # Children are therefore only materialized when a node is opened, with a
+    # placeholder child standing in until then.
+    _PLACEHOLDER_TEXT = "…"
+
+    # Large containers (e.g. a level's 48k-entry collision grid) are inserted
+    # in chunks: bulk Treeview inserts degrade badly past a few thousand rows.
+    _CHUNK_SIZE = 500
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_status: Callable[[str], None] | None = None,
+        on_edit: Callable[[], None] | None = None,
+    ):
+        super().__init__(master)
+        self.hxs: HXSFile | None = None
         self.node_meta: Dict[str, Dict[str, Any]] = {}
-
-        self.shims_var = tk.StringVar(value=initial_shims)
-        self.status_var = tk.StringVar(value="Ready")
         self.selected_item: str | None = None
-        self.edit_type_var = tk.StringVar(value="str")
-        self.edit_value_var = tk.StringVar()
-
+        self.on_status = on_status
+        self.on_edit = on_edit
+        self.edit_type_var = tk.StringVar(master=self, value="str")
+        self.edit_value_var = tk.StringVar(master=self)
         self._build_ui()
-
-        if initial_path:
-            self.open_path(Path(initial_path))
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        toolbar = ttk.Frame(self, padding=8)
-        toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(6, weight=1)
+        pane = ttk.Panedwindow(self, orient="horizontal")
+        pane.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Button(toolbar, text="Open", command=self.open_dialog).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(toolbar, text="Save", command=self.save_current).grid(row=0, column=1, padx=6)
-        ttk.Button(toolbar, text="Save As", command=self.save_as_dialog).grid(row=0, column=2, padx=6)
-        ttk.Label(toolbar, text="Shims").grid(row=0, column=3, padx=(18, 6))
-        ttk.Entry(toolbar, textvariable=self.shims_var, width=20).grid(row=0, column=4, padx=6)
-        ttk.Button(toolbar, text="Reload", command=self.reload_current).grid(row=0, column=5, padx=6)
-
-        self.path_label = ttk.Label(toolbar, text="No file loaded")
-        self.path_label.grid(row=0, column=6, sticky="ew", padx=(18, 0))
-
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=1, column=0, sticky="nsew")
-
-        summary_frame = ttk.Frame(notebook, padding=8)
-        schemas_frame = ttk.Frame(notebook, padding=8)
-        object_frame = ttk.Frame(notebook, padding=8)
-
-        notebook.add(summary_frame, text="Summary")
-        notebook.add(schemas_frame, text="Schemas")
-        notebook.add(object_frame, text="Object")
-
-        summary_frame.columnconfigure(0, weight=1)
-        summary_frame.rowconfigure(0, weight=1)
-        self.summary_text = tk.Text(summary_frame, wrap="word")
-        self.summary_text.grid(row=0, column=0, sticky="nsew")
-        self.summary_text.configure(state="disabled")
-
-        schemas_frame.columnconfigure(0, weight=1)
-        schemas_frame.rowconfigure(0, weight=1)
-        self.schemas_text = tk.Text(schemas_frame, wrap="none")
-        self.schemas_text.grid(row=0, column=0, sticky="nsew")
-        self.schemas_text.configure(state="disabled")
-
-        object_frame.columnconfigure(0, weight=1)
-        object_frame.rowconfigure(0, weight=1)
-        object_pane = ttk.Panedwindow(object_frame, orient="horizontal")
-        object_pane.grid(row=0, column=0, sticky="nsew")
-
-        tree_frame = ttk.Frame(object_pane, padding=(0, 0, 8, 0))
-        detail_frame = ttk.Frame(object_pane)
+        tree_frame = ttk.Frame(pane, padding=(0, 0, 8, 0))
+        detail_frame = ttk.Frame(pane)
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(1, weight=1)
-        detail_frame.rowconfigure(5, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
 
         self.object_tree = ttk.Treeview(tree_frame, columns=("kind", "value"), show="tree headings")
         self.object_tree.heading("#0", text="Path")
@@ -225,8 +211,8 @@ class HXSFileEditor(DPIAwareTk):
         object_scroll.grid(row=0, column=1, sticky="ns")
         self.object_tree.configure(yscrollcommand=object_scroll.set)
 
-        object_pane.add(tree_frame, weight=3)
-        object_pane.add(detail_frame, weight=2)
+        pane.add(tree_frame, weight=3)
+        pane.add(detail_frame, weight=2)
 
         self.object_info = tk.Text(detail_frame, height=14, wrap="word")
         self.object_info.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
@@ -248,13 +234,12 @@ class HXSFileEditor(DPIAwareTk):
         self.apply_button = ttk.Button(detail_frame, text="Apply", command=self.apply_edit)
         self.apply_button.grid(row=3, column=1, sticky="e", pady=(8, 0))
 
-        status = ttk.Label(self, textvariable=self.status_var, anchor="w", padding=8)
-        status.grid(row=2, column=0, sticky="ew")
-
-        self._set_text(self.summary_text, "Open an HXS file to inspect it.")
-        self._set_text(self.schemas_text, "")
         self._set_text(self.object_info, "No object selected.")
         self._set_editor_enabled(False)
+
+    def _status(self, message: str) -> None:
+        if self.on_status is not None:
+            self.on_status(message)
 
     def _set_text(self, widget: tk.Text, text: str) -> None:
         widget.configure(state="normal")
@@ -270,93 +255,20 @@ class HXSFileEditor(DPIAwareTk):
         self.value_entry.configure(state=entry_state)
         self.apply_button.configure(state=button_state)
 
-    def open_dialog(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Open HXS file",
-            filetypes=[("Hxbit files", "*.bin *.dat"), ("All files", "*.*")],
-        )
-        if path:
-            self.open_path(Path(path))
-
-    def open_path(self, path: Path) -> None:
-        try:
-            hxs = HXSFile(shims=self.shims_var.get() or None)
-            with path.open("rb") as f:
-                hxs.deserialise(f)
-        except Exception as e:
-            messagebox.showerror("Open failed", str(e))
-            self.status_var.set(f"Failed to open {path.name}")
-            return
-
-        self.current_path = path
-        self.current_file = hxs
-        self.path_label.configure(text=str(path))
-        self._refresh_views()
-        self.status_var.set(f"Loaded {path.name}")
-        self.title(f"hxbit editor - {path.name}")
-
-    def reload_current(self) -> None:
-        if self.current_path is None:
-            self.open_dialog()
-            return
-        self.open_path(self.current_path)
-
-    def save_current(self) -> None:
-        if self.current_file is None:
-            return
-        if self.current_path is None:
-            self.save_as_dialog()
-            return
-        try:
-            self.current_path.write_bytes(self.current_file.serialise())
-        except Exception as e:
-            messagebox.showerror("Save failed", str(e))
-            self.status_var.set(f"Failed to save {self.current_path.name}")
-            return
-        self.status_var.set(f"Saved {self.current_path.name}")
-
-    def save_as_dialog(self) -> None:
-        if self.current_file is None:
-            return
-        path = filedialog.asksaveasfilename(
-            title="Save HXS file",
-            defaultextension=".bin",
-            filetypes=[("Hxbit files", "*.bin *.dat"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        self.current_path = Path(path)
-        self.save_current()
-        self.path_label.configure(text=str(self.current_path))
-        self.title(f"hxbit editor - {self.current_path.name}")
-
-    def _refresh_views(self) -> None:
-        assert self.current_file is not None
-        hxs = self.current_file
-
-        summary_lines = [
-            f"Magic: {hxs.magic.value}",
-            f"Version: {hxs.version.value}",
-            f"Class definitions: {len(hxs.classdefs)}",
-            f"Schemas: {len(hxs.schemas)}",
-            f"Parsed objects: {len(hxs.objects)}",
-            f"Root object parsed: {'yes' if hxs.obj is not None else 'no'}",
-            f"Raw object payload preserved: {'yes' if hxs.raw_object_data is not None else 'no'}",
-        ]
-        if hxs.obj and hxs.obj.schema.classdef:
-            summary_lines.append(f"Root class: {hxs.obj.schema.classdef.name.value}")
-        if hxs.object_parse_error is not None:
-            summary_lines.append("")
-            summary_lines.append("Object parse warning:")
-            summary_lines.append(str(hxs.object_parse_error))
-        self._set_text(self.summary_text, "\n".join(summary_lines))
-        self._set_text(self.schemas_text, hxs.pprint_classdefs() + "\n\n" + hxs.pprint_schemas())
-
+    def load(self, hxs: HXSFile | None) -> None:
+        """Display the root objects of `hxs` (or clear the view if None)."""
+        self.hxs = hxs
         self.object_tree.delete(*self.object_tree.get_children())
         self.node_meta.clear()
         self.selected_item = None
 
-        if hxs.obj is None:
+        if hxs is None:
+            self._set_text(self.object_info, "No file loaded.")
+            self._set_editor_enabled(False)
+            return
+
+        roots = hxs.roots or ([hxs.obj] if hxs.obj is not None else [])
+        if not roots:
             message = "Typed root object parsing is not available for this file.\n\n"
             if hxs.object_parse_error is not None:
                 message += f"Reason: {hxs.object_parse_error}\n\n"
@@ -365,33 +277,31 @@ class HXSFileEditor(DPIAwareTk):
             self._set_editor_enabled(False)
             return
 
-        root_name = hxs.obj.schema.classdef.name.value if hxs.obj.schema.classdef else "Root"
-        root_id = self.object_tree.insert(
-            "",
-            "end",
-            text=root_name,
-            values=(_value_kind(hxs.obj), _value_summary(hxs.obj)),
-            open=True,
-        )
-        self.node_meta[root_id] = {
-            "value": hxs.obj,
-            "container": None,
-            "key": None,
-            "path": root_name,
-            "ancestors": frozenset({id(hxs.obj)}),
-            "populated": False,
-        }
-        self._populate_children(root_id)
-        self.object_tree.selection_set(root_id)
-        self.object_tree.focus(root_id)
+        first_id: str | None = None
+        for root in roots:
+            root_name = root.schema.classdef.name.value if root.schema.classdef else "Root"
+            root_id = self.object_tree.insert(
+                "",
+                "end",
+                text=root_name,
+                values=(_value_kind(root), _value_summary(root)),
+                open=True,
+            )
+            self.node_meta[root_id] = {
+                "value": root,
+                "container": None,
+                "key": None,
+                "path": root_name,
+                "ancestors": frozenset({id(root)}),
+                "populated": False,
+            }
+            self._populate_children(root_id)
+            if first_id is None:
+                first_id = root_id
+        if first_id is not None:
+            self.object_tree.selection_set(first_id)
+            self.object_tree.focus(first_id)
         self.on_tree_select()
-
-    # The object graph is heavily cross-linked (thousands of objects, where
-    # e.g. every entity points back at the level and the level at every
-    # entity), so eagerly expanding it into the tree explodes combinatorially.
-    # Children are therefore only materialized when a node is opened, with a
-    # placeholder child standing in until then.
-    _PLACEHOLDER_TEXT = "…"
 
     @staticmethod
     def _is_expandable(value: Any) -> bool:
@@ -410,10 +320,6 @@ class HXSFileEditor(DPIAwareTk):
         if isinstance(value, list):
             return [(f"[{i}]", f"[{i}]", i, child) for i, child in enumerate(value)]
         return []
-
-    # Large containers (e.g. a level's 48k-entry collision grid) are inserted
-    # in chunks: bulk Treeview inserts degrade badly past a few thousand rows.
-    _CHUNK_SIZE = 500
 
     def _populate_children(self, parent: str) -> None:
         meta = self.node_meta[parent]
@@ -559,7 +465,7 @@ class HXSFileEditor(DPIAwareTk):
         return raw
 
     def apply_edit(self) -> None:
-        if self.current_file is None or self.selected_item is None:
+        if self.hxs is None or self.selected_item is None:
             return
         meta = self.node_meta[self.selected_item]
         container = meta["container"]
@@ -575,15 +481,187 @@ class HXSFileEditor(DPIAwareTk):
 
         container[key] = new_value
         meta["value"] = new_value
-        self.current_file.object_parse_error = None
-        self.current_file.raw_object_data = None
+        # Force serialise() to re-encode from the typed object graph instead
+        # of falling back to the preserved raw payload.
+        self.hxs.object_parse_error = None
+        self.hxs.raw_object_data = None
 
         self.object_tree.item(
             self.selected_item,
             values=(_value_kind(new_value), _value_summary(new_value)),
         )
         self.on_tree_select()
-        self.status_var.set("Applied edit")
+        self._status("Applied edit")
+        if self.on_edit is not None:
+            self.on_edit()
+
+
+class HXSFileEditor(DPIAwareTk):
+    def __init__(self, initial_path: str | None = None, initial_shims: str = "deadcells"):
+        super().__init__()
+        scaling = 1.0
+        if os.name != "nt":
+            scaling = _fix_hidpi_linux(self)
+        self.title("hxbit editor")
+        self.geometry(f"{round(1200 * scaling)}x{round(800 * scaling)}")
+
+        self.current_path: Path | None = None
+        self.current_file: HXSFile | None = None
+
+        self.shims_var = tk.StringVar(value=initial_shims)
+        self.status_var = tk.StringVar(value="Ready")
+
+        self._build_ui()
+
+        if initial_path:
+            self.open_path(Path(initial_path))
+
+    def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(self, padding=8)
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(6, weight=1)
+
+        ttk.Button(toolbar, text="Open", command=self.open_dialog).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(toolbar, text="Save", command=self.save_current).grid(row=0, column=1, padx=6)
+        ttk.Button(toolbar, text="Save As", command=self.save_as_dialog).grid(row=0, column=2, padx=6)
+        ttk.Label(toolbar, text="Shims").grid(row=0, column=3, padx=(18, 6))
+        ttk.Entry(toolbar, textvariable=self.shims_var, width=20).grid(row=0, column=4, padx=6)
+        ttk.Button(toolbar, text="Reload", command=self.reload_current).grid(row=0, column=5, padx=6)
+
+        self.path_label = ttk.Label(toolbar, text="No file loaded")
+        self.path_label.grid(row=0, column=6, sticky="ew", padx=(18, 0))
+
+        notebook = ttk.Notebook(self)
+        notebook.grid(row=1, column=0, sticky="nsew")
+
+        summary_frame = ttk.Frame(notebook, padding=8)
+        schemas_frame = ttk.Frame(notebook, padding=8)
+        object_frame = ttk.Frame(notebook, padding=8)
+
+        notebook.add(summary_frame, text="Summary")
+        notebook.add(schemas_frame, text="Schemas")
+        notebook.add(object_frame, text="Object")
+
+        summary_frame.columnconfigure(0, weight=1)
+        summary_frame.rowconfigure(0, weight=1)
+        self.summary_text = tk.Text(summary_frame, wrap="word")
+        self.summary_text.grid(row=0, column=0, sticky="nsew")
+        self.summary_text.configure(state="disabled")
+
+        schemas_frame.columnconfigure(0, weight=1)
+        schemas_frame.rowconfigure(0, weight=1)
+        self.schemas_text = tk.Text(schemas_frame, wrap="none")
+        self.schemas_text.grid(row=0, column=0, sticky="nsew")
+        self.schemas_text.configure(state="disabled")
+
+        object_frame.columnconfigure(0, weight=1)
+        object_frame.rowconfigure(0, weight=1)
+        self.tree_frame = HXSTreeFrame(object_frame, on_status=self.status_var.set)
+        self.tree_frame.grid(row=0, column=0, sticky="nsew")
+
+        status = ttk.Label(self, textvariable=self.status_var, anchor="w", padding=8)
+        status.grid(row=2, column=0, sticky="ew")
+
+        self._set_text(self.summary_text, "Open an HXS file to inspect it.")
+        self._set_text(self.schemas_text, "")
+
+    def _set_text(self, widget: tk.Text, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def open_dialog(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open HXS file",
+            filetypes=[("Hxbit files", "*.bin *.dat"), ("All files", "*.*")],
+        )
+        if path:
+            self.open_path(Path(path))
+
+    def open_path(self, path: Path) -> None:
+        try:
+            hxs = HXSFile(shims=self.shims_var.get() or None)
+            with path.open("rb") as f:
+                hxs.deserialise(f)
+        except Exception as e:
+            messagebox.showerror("Open failed", str(e))
+            self.status_var.set(f"Failed to open {path.name}")
+            return
+
+        self.current_path = path
+        self.current_file = hxs
+        self.path_label.configure(text=str(path))
+        self._refresh_views()
+        self.status_var.set(f"Loaded {path.name}")
+        self.title(f"hxbit editor - {path.name}")
+
+    def reload_current(self) -> None:
+        if self.current_path is None:
+            self.open_dialog()
+            return
+        self.open_path(self.current_path)
+
+    def save_current(self) -> None:
+        if self.current_file is None:
+            return
+        if self.current_path is None:
+            self.save_as_dialog()
+            return
+        try:
+            self.current_path.write_bytes(self.current_file.serialise())
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            self.status_var.set(f"Failed to save {self.current_path.name}")
+            return
+        self.status_var.set(f"Saved {self.current_path.name}")
+
+    def save_as_dialog(self) -> None:
+        if self.current_file is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save HXS file",
+            defaultextension=".bin",
+            filetypes=[("Hxbit files", "*.bin *.dat"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.current_path = Path(path)
+        self.save_current()
+        self.path_label.configure(text=str(self.current_path))
+        self.title(f"hxbit editor - {self.current_path.name}")
+
+    def _refresh_views(self) -> None:
+        assert self.current_file is not None
+        hxs = self.current_file
+
+        root_names = [
+            r.schema.classdef.name.value
+            for r in (hxs.roots or ([hxs.obj] if hxs.obj else []))
+            if r.schema.classdef
+        ]
+        summary_lines = [
+            f"Magic: {hxs.magic.value}",
+            f"Version: {hxs.version.value}",
+            f"Class definitions: {len(hxs.classdefs)}",
+            f"Schemas: {len(hxs.schemas)}",
+            f"Parsed objects: {len(hxs.objects)}",
+            f"Root objects parsed: {len(root_names)}",
+            f"Raw object payload preserved: {'yes' if hxs.raw_object_data is not None else 'no'}",
+        ]
+        if root_names:
+            summary_lines.append(f"Root classes: {', '.join(root_names)}")
+        if hxs.object_parse_error is not None:
+            summary_lines.append("")
+            summary_lines.append("Object parse warning:")
+            summary_lines.append(str(hxs.object_parse_error))
+        self._set_text(self.summary_text, "\n".join(summary_lines))
+        self._set_text(self.schemas_text, hxs.pprint_classdefs() + "\n\n" + hxs.pprint_schemas())
+
+        self.tree_frame.load(hxs)
 
 
 def launch_gui(initial_path: str | None = None, initial_shims: str = "deadcells") -> None:

@@ -1530,7 +1530,10 @@ class HXSFile(Serialisable):
                     self._write_value(defn.value_type, v)
         
         elif kind == PropTypeDesc.Kind.PSerializable and isinstance(defn, NameDef):
-            self._write_ref(value)
+            self._write_ref(value, self._get_schema_by_name(defn.name.value))
+
+        elif kind == PropTypeDesc.Kind.PSerInterface:
+            self._write_ref(value, None)
 
         elif kind == PropTypeDesc.Kind.PObj and isinstance(defn, ObjDef):
             if value is None:
@@ -1588,29 +1591,37 @@ class HXSFile(Serialisable):
         else:
             raise NotImplementedError(f"Serialization for {kind.name} is not implemented.")
 
-    def _write_ref(self, obj: Obj | None) -> None:
-        """Writes an object reference, handling nulls and cycles."""
+    def _write_ref(self, obj: Obj | None, declared_schema: "Schema | None" = None) -> None:
+        """Writes an object reference.
+        """
         if obj is None:
             self.buffer.write(VarInt(0).serialise())
             return
-        
+
         obj_id = id(obj)
         if obj_id in self.written_objects:
-            # This object has already been written, just write its UID.
             uid = self.written_objects[obj_id]
             self.buffer.write(VarInt(uid).serialise())
             return
-        
-        # This is a new object. Allocate a UID, write it, and serialize the object.
+
         new_uid = self.next_uid
         self.next_uid += 1
-        
+
         self.written_objects[obj_id] = new_uid
         self.buffer.write(VarInt(new_uid).serialise())
-        
-        # NOTE: Polymorphism logic (writing a runtime CLID) would go here.
-        # We are skipping it as requested.
-        
+
+        if declared_schema is None or declared_schema.clid.value == 0:
+            class_name = (
+                obj.schema.classdef.name.value
+                if obj.schema and obj.schema.classdef
+                else None
+            )
+            if class_name is None:
+                raise ValueError(
+                    "Cannot write a polymorphic reference to an object with no class name."
+                )
+            self.buffer.write(struct.pack(">H", self.clid_hash(class_name)))
+
         obj.serialise()
 
     def serialise(self) -> bytes:
@@ -1624,8 +1635,8 @@ class HXSFile(Serialisable):
         if self.raw_object_data is not None:
             object_data = self.raw_object_data
         else:
-            if self.obj:
-                self._write_ref(self.obj)
+            for root in (self.roots or ([self.obj] if self.obj else [])):
+                self._write_ref(root, root.schema)
             object_data = self.buffer.getvalue()
         
         # Now, build the final file with the header and object data
@@ -1724,18 +1735,11 @@ class HXSFile(Serialisable):
         except ValueError:
             return None
 
-    @staticmethod
-    def clid_hash(name: str) -> int:
-        """hxbit's runtime class id: a 16-bit-ish hash of the class name.
-
-        Runtime refs to polymorphic classes store this hash, NOT the 2-byte
-        value in the ClassDef header (which is the class's index in the
-        game's hxbit.Serializer.CLASSES list).
-        """
-        v = 1
-        for ch in name:
-            v = (v * 223 + ord(ch)) & 0xFFFFFFFF
-        return 1 + ((v & 0x3FFFFFFF) % 65423)
+    # hxbit's runtime class id: a hash of the class name. Runtime refs to
+    # polymorphic classes store this hash, NOT the 2-byte value in the
+    # ClassDef header (which is the class's index in the game's
+    # hxbit.Serializer.CLASSES list).
+    clid_hash = staticmethod(hxbit_hash)
 
     def _get_schema_by_clid(self, clid: int) -> "Schema":
         for i, class_def in enumerate(self.classdefs):
